@@ -1,0 +1,273 @@
+name: Smart Download & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "File URL"
+        required: true
+        type: string
+
+      filename:
+        description: "Release filename (leave blank for auto-detect)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  SPLIT_SIZE: "1900M"
+  CONNECTIONS: "16"
+
+jobs:
+  download-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      # ────────────────────────────────────────────
+      - name: Install tools
+        run: |
+          sudo apt-get install -y aria2 pv
+
+      # ────────────────────────────────────────────
+      - name: Resolve filename & metadata
+        id: meta
+        run: |
+          URL="${{ inputs.url }}"
+
+          # ── Detect filename ──
+          if [[ -n "${{ inputs.filename }}" ]]; then
+            RAW_NAME="${{ inputs.filename }}"
+          else
+            # Try Content-Disposition first
+            RAW_NAME=$(curl -sIL "$URL" \
+              | grep -i 'content-disposition' \
+              | sed -n 's/.*filename="\?\([^";\r\n]*\).*/\1/Ip' \
+              | tr -d '[:space:]' | head -1)
+
+            # Fall back to URL path segment
+            if [[ -z "$RAW_NAME" ]]; then
+              RAW_NAME=$(basename "$(echo "$URL" | cut -d'?' -f1)")
+            fi
+          fi
+
+          # ── Sanitize name ──
+          SAFE_NAME=$(echo "$RAW_NAME" | tr ' ' '_' | tr -cd '[:alnum:]._-')
+          [[ -z "$SAFE_NAME" ]] && SAFE_NAME="downloaded_file"
+
+          # ── Detect if already compressed ──
+          EXT="${SAFE_NAME##*.}"
+          case "${EXT,,}" in
+            zip|gz|bz2|xz|zst|7z|rar|lz4) IS_COMPRESSED=true ;;
+            *) IS_COMPRESSED=false ;;
+          esac
+
+          # ── Detect MIME type as fallback for compression check ──
+          MIME=$(curl -sI "$URL" | grep -i content-type | awk '{print $2}' | tr -d '\r')
+          case "$MIME" in
+            application/zip|application/gzip|application/x-bzip2|\
+            application/x-xz|application/zstd|application/x-7z-compressed|\
+            application/x-rar-compressed)
+              IS_COMPRESSED=true ;;
+          esac
+
+          # ── Get remote file size (if server provides it) ──
+          REMOTE_SIZE=$(curl -sI "$URL" | grep -i content-length | awk '{print $2}' | tr -d '\r' | head -1)
+          [[ -z "$REMOTE_SIZE" ]] && REMOTE_SIZE="unknown"
+
+          # ── Generate tag & release name ──
+          TIMESTAMP=$(date +'%Y%m%d-%H%M')
+          TAG="release-${TIMESTAMP}-${{ github.run_number }}"
+          RNAME="${SAFE_NAME} — ${TIMESTAMP}"
+
+          echo "raw_name=$RAW_NAME"             >> $GITHUB_OUTPUT
+          echo "safe_name=$SAFE_NAME"           >> $GITHUB_OUTPUT
+          echo "is_compressed=$IS_COMPRESSED"   >> $GITHUB_OUTPUT
+          echo "tag=$TAG"                       >> $GITHUB_OUTPUT
+          echo "release_name=$RNAME"            >> $GITHUB_OUTPUT
+          echo "remote_size=$REMOTE_SIZE"       >> $GITHUB_OUTPUT
+
+          echo "Filename     : $SAFE_NAME"
+          echo "Compressed   : $IS_COMPRESSED"
+          echo "Remote size  : $REMOTE_SIZE bytes"
+          echo "Tag          : $TAG"
+
+      # ────────────────────────────────────────────
+      - name: Download (aria2 — resumable, multi-connection)
+        run: |
+          aria2c \
+            --split=${{ env.CONNECTIONS }} \
+            --max-connection-per-server=${{ env.CONNECTIONS }} \
+            --min-split-size=20M \
+            --max-tries=10 \
+            --retry-wait=10 \
+            --continue=true \
+            --file-allocation=none \
+            --console-log-level=notice \
+            --summary-interval=15 \
+            --max-overall-download-limit=0 \
+            -o "${{ steps.meta.outputs.safe_name }}" \
+            "${{ inputs.url }}"
+
+          # Verify file exists and has content
+          FILE="${{ steps.meta.outputs.safe_name }}"
+          if [[ ! -s "$FILE" ]]; then
+            echo "ERROR: Downloaded file is empty or missing"
+            exit 1
+          fi
+          echo "Download complete: $(du -sh "$FILE" | cut -f1)"
+
+      # ────────────────────────────────────────────
+      - name: Compress if not already compressed
+        id: compress
+        run: |
+          FILE="${{ steps.meta.outputs.safe_name }}"
+          IS_COMPRESSED="${{ steps.meta.outputs.is_compressed }}"
+          FINAL_FILE="$FILE"
+
+          if [[ "$IS_COMPRESSED" == "false" ]]; then
+            echo "Compressing $FILE -> ${FILE}.zst (zstd level 9, multi-threaded)"
+            zstd -9 -T0 --progress "$FILE" -o "${FILE}.zst"
+            rm -f "$FILE"
+            FINAL_FILE="${FILE}.zst"
+            echo "compressed=true" >> $GITHUB_OUTPUT
+          else
+            echo "Already compressed — skipping"
+            echo "compressed=false" >> $GITHUB_OUTPUT
+          fi
+
+          FINAL_SIZE=$(du -sh "$FINAL_FILE" | cut -f1)
+          echo "final_file=$FINAL_FILE"   >> $GITHUB_OUTPUT
+          echo "final_size=$FINAL_SIZE"   >> $GITHUB_OUTPUT
+          echo "Final file: $FINAL_FILE ($FINAL_SIZE)"
+
+      # ────────────────────────────────────────────
+      - name: Split large files if needed
+        id: split
+        run: |
+          FINAL_FILE="${{ steps.compress.outputs.final_file }}"
+          SPLIT_SIZE="${{ env.SPLIT_SIZE }}"
+          FILE_SIZE=$(stat -c%s "$FINAL_FILE")
+          SPLIT_BYTES=$(numfmt --from=iec "$SPLIT_SIZE")
+          mkdir -p parts
+
+          if [[ $FILE_SIZE -gt $SPLIT_BYTES ]]; then
+            echo "File is $(numfmt --to=iec $FILE_SIZE) — splitting into ${SPLIT_SIZE} parts"
+            split --bytes="$SPLIT_SIZE" --numeric-suffixes=1 --suffix-length=3 \
+              "$FINAL_FILE" "parts/${FINAL_FILE}.part"
+            echo "split=true" >> $GITHUB_OUTPUT
+            PART_COUNT=$(ls parts/ | wc -l)
+            echo "part_count=$PART_COUNT" >> $GITHUB_OUTPUT
+          else
+            echo "File fits within limit — no splitting needed"
+            cp "$FINAL_FILE" parts/
+            echo "split=false"  >> $GITHUB_OUTPUT
+            echo "part_count=1" >> $GITHUB_OUTPUT
+          fi
+
+          ls -lh parts/
+
+      # ────────────────────────────────────────────
+      - name: Generate checksums
+        run: |
+          cd parts/
+          sha256sum * > SHA256SUMS.txt
+          echo "Checksums:"
+          cat SHA256SUMS.txt
+
+      # ────────────────────────────────────────────
+      - name: Build release notes
+        id: notes
+        run: |
+          WAS_COMPRESSED="${{ steps.compress.outputs.compressed }}"
+          WAS_SPLIT="${{ steps.split.outputs.split }}"
+          PART_COUNT="${{ steps.split.outputs.part_count }}"
+          FINAL_SIZE="${{ steps.compress.outputs.final_size }}"
+
+          # Compute creation timestamp
+          CREATED=$(date -u +'%Y-%m-%d %H:%M UTC')
+
+          cat > release_notes.md <<EOF
+          ## ${{ steps.meta.outputs.release_name }}
+
+          | Field | Value |
+          |-------|-------|
+          | Source URL | \`${{ inputs.url }}\` |
+          | Original filename | \`${{ steps.meta.outputs.raw_name }}\` |
+          | Final size | $FINAL_SIZE |
+          | Compressed | $WAS_COMPRESSED |
+          | Split | $WAS_SPLIT ($PART_COUNT part(s)) |
+          | Created | $CREATED |
+          | Run | [${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+
+          ### Reassembly (if split)
+          \`\`\`bash
+          cat filename.part* > original_filename
+          \`\`\`
+
+          ### Verify integrity
+          \`\`\`bash
+          sha256sum -c SHA256SUMS.txt
+          \`\`\`
+
+          ### Checksums
+          \`\`\`
+          $(cat parts/SHA256SUMS.txt)
+          \`\`\`
+          EOF
+
+          cat release_notes.md
+
+      # ────────────────────────────────────────────
+      - name: Create Release & Upload
+        id: release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: "${{ steps.meta.outputs.tag }}"
+          name: "${{ steps.meta.outputs.release_name }}"
+          bodyFile: "release_notes.md"
+          artifacts: "parts/*"
+          artifactErrorsFailBuild: true
+          draft: false
+          prerelease: false
+
+      # ────────────────────────────────────────────
+      - name: Delete run artifacts
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REPO="${{ github.repository }}"
+          RUN_ID="${{ github.run_id }}"
+
+          ARTIFACTS=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${REPO}/actions/runs/${RUN_ID}/artifacts" \
+            --jq '.artifacts[] | "\(.id) \(.name)"')
+
+          if [[ -z "$ARTIFACTS" ]]; then
+            echo "No artifacts to delete."
+            exit 0
+          fi
+
+          while IFS=' ' read -r ART_ID ART_NAME; do
+            echo "Deleting artifact: ${ART_NAME} [id=${ART_ID}]"
+            gh api --method DELETE \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${REPO}/actions/artifacts/${ART_ID}" && \
+              echo "  Deleted." || echo "  Failed."
+          done <<< "$ARTIFACTS"
+
+      # ────────────────────────────────────────────
+      - name: Summary
+        run: |
+          echo "### Release Created" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| File | \`${{ steps.compress.outputs.final_file }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Size | ${{ steps.compress.outputs.final_size }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | \`${{ steps.meta.outputs.tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Parts | ${{ steps.split.outputs.part_count }} |" >> $GITHUB_STEP_SUMMARY
