@@ -445,7 +445,7 @@ jobs:
           artifacts:               "/tmp/parts/*"
           artifactErrorsFailBuild: true
           prerelease:              ${{ inputs.prerelease }}
-
+          makeLatest:              true
       # ════════════════════════════════════════════════════════════════════════
       #  §11  CLEANUP
       # ════════════════════════════════════════════════════════════════════════
