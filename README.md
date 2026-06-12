@@ -1,110 +1,84 @@
-# ⬇️ Smart Download & Release
+```markdown
+# ⬇️ File Download & Release Workflow
 
-> A GitHub Actions workflow that downloads any file from the internet and publishes it as a GitHub Release — with resumable downloads, smart compression, automatic splitting, and checksum generation.
-
----
-
-## ✨ Features
-
-| Feature | Details |
-|---------|---------|
-| ⬇️ Smart Download | `aria2c` with automatic resume + parallel connections |
-| 🧠 Filename Detection | From `Content-Disposition` header or URL path |
-| 🗜️ Conditional Compression | ZIP compression only if the file isn't already compressed |
-| ✂️ Auto Split | Splits large files that exceed GitHub's 2GB limit |
-| 🔐 Checksums | Automatically generates `SHA256SUMS.txt` for all artifacts |
-| 📝 Release Notes | Auto-generated table with source URL, details, and timestamp |
-| 🏷️ Dynamic Tag | timestamp + run number — or set it manually |
+A high-performance GitHub Actions workflow designed to download large files from any direct link using `aria2c`, perform optional integrity verification, apply smart compression, and automatically handle GitHub's release size limits via splitting.
 
 ---
 
-## 🚀 Usage
+## 🚀 Key Features
 
-### 1. Go to the **Actions** tab
-
-### 2. Select **⬇️ Smart Download & Release**
-
-### 3. Click **Run workflow** and fill in the inputs:
-
-| Input | Description | Required? |
-|-------|-------------|-----------|
-| `url` | 🔗 URL of the file to download | ✅ Yes |
-| `filename` | 📁 Output filename in the release | No (auto-detected) |
-| `compress` | 🗜️ Compress the file if not already compressed | No (default: `true`) |
-| `split_size` | ✂️ Split threshold (e.g. `1900M`) | No (default: `1900M`) |
-| `release_tag` | 🏷️ Release tag | No (auto-generated) |
-| `release_name` | 📝 Release title | No (auto-generated) |
-| `connections` | ⚡ Number of parallel download connections | No (default: `8`) |
+* **Accelerated Downloads:** Uses `aria2c` for multi-connection, parallel, and resumable downloading.
+* **Smart Content Detection:** Auto-resolves filenames via HTTP headers (`Content-Disposition`) or target URLs.
+* **Intelligent Compression:** Detects the file type via MIME checking; skips compression if the file is already a known archive type (ZIP, GZIP, XZ, ZSTD, etc.) to save time and compute power.
+* **Automatic Splitting:** Automatically splits artifacts into numbered chunks if they exceed GitHub's single-file limits.
+* **Integrity & Security:** Supports on-the-fly SHA256 checksum verification during download and generates a global `SHA256SUMS.txt` for the final release assets.
 
 ---
 
-## 📋 Examples
+## ⚙️ Workflow Inputs
 
-**Download NDK from Google:**
-```
-url: https://dl.google.com/android/repository/android-ndk-r17c-linux-x86_64.zip
-```
+When triggering the workflow via **Workflow Dispatch**, you can configure the following parameters:
 
-**Download a large file with splitting:**
-```
-url:         https://example.com/large-file.tar.gz
-split_size:  1900M
-connections: 16
-```
-
-**Download a raw image and compress it:**
-```
-url:      https://example.com/firmware.img
-compress: true
-filename: my-firmware.img
-```
+| Input | Description | Default | Required |
+| :--- | :--- | :--- | :--- |
+| `url` | 🔗 Direct download link of the target file. | *None* | **Yes** |
+| `filename` | 📁 Override output filename (leave blank for auto-detection). | *Auto* | No |
+| `expected_checksum` | 🔐 Expected SHA256 to verify integrity after download. | *None* | No |
+| `connections` | ⚡ Maximum parallel download connections per server. | `8` | No |
+| `compress_format` | 🗜️ Target compression format (`zst`, `tar.gz`, `zip`, `none`). | `zst` | No |
+| `split_size` | ✂️ Max chunk threshold (e.g., `1900M`). Leave blank to disable. | `1900M` | No |
+| `extra_header` | 🔑 Custom HTTP headers for authentication (e.g., `Authorization: Bearer TOKEN`). | *None* | No |
+| `prerelease` | 🚧 Mark the generated GitHub release as a pre-release. | `false` | No |
 
 ---
 
-## 🔧 How It Works
+## 🛠️ Usage Examples
+
+### Standard Usage (Auto-detect & Max Compress)
+Downloads the file, auto-detects its name, verifies nothing is already compressed, and packs it as `.zst`.
+```yaml
+url: [https://example.com/software-disk-image.img](https://example.com/software-disk-image.img)
 
 ```
-1. Resolves the filename from Content-Disposition header or URL path
-2. Downloads the file via aria2c with automatic resume support
-3. Detects whether the file is already compressed — compresses it if not (when enabled)
-4. Splits the file if it exceeds the configured size limit
-5. Generates SHA256SUMS.txt for all output files
-6. Publishes everything as a GitHub Release with auto-generated release notes
-```
-
----
-
-## ⚙️ Requirements
-
-- A public or private GitHub repository
-- `contents: write` permission enabled in the workflow (already included)
-- No additional setup required
-
----
-
-## 📦 Release Structure
+### Download & Authenticate
+Downloads from a protected server or private API endpoint using custom headers.
+```yaml
+url:            [https://api.example.com/v1/assets/package.tar](https://api.example.com/v1/assets/package.tar)
+compress_format: none
+extra_header:    Authorization: Bearer ghp_yourSecretTokenHere
 
 ```
-📦 Release
-├── filename.zip          ← the file (compressed or as-is)
-├── filename.zip.part001  ← (if splitting was triggered)
-├── filename.zip.part002
-└── SHA256SUMS.txt        ← checksums for integrity verification
-```
+### Secure Large Download with Splitting
+Downloads a huge database backup, verifies its integrity against a known hash, and cuts it into 1.9GB chunks if it exceeds the limit.
+```yaml
+url:               [https://backups.internal.net/db-dump-2026.sql](https://backups.internal.net/db-dump-2026.sql)
+expected_checksum: a1b2c3d4e5f6...your_sha256_hash...7h8i9j0k
+split_size:        1900M
 
-### Verify file integrity after downloading:
+```
+## 📦 Release Outputs & Restoration
+The generated release will be marked automatically as the **Latest Release** and will contain:
+ 1. The downloaded file (or its compressed equivalent).
+ 2. Numbered chunks (.part001, .part002, etc.) if splitting was triggered.
+ 3. SHA256SUMS.txt containing hashes for all uploaded assets.
+### 1. Verify Asset Integrity
+After downloading the release assets to your local machine, always verify they aren't corrupted:
 ```bash
 sha256sum -c SHA256SUMS.txt
-```
 
-### Reassemble split parts after downloading:
+```
+### 2. Reassemble Split Parts (If applicable)
+If the file was split during the workflow run, merge the chunks back together into the original file before usage:
 ```bash
-cat filename.zip.part* > filename.zip
+# Combine parts
+cat filename.zst.part* > filename.zst
+
+# Re-verify the merged file integrity
+sha256sum -c SHA256SUMS.txt
+
+```
+## 📄 License
+This project is licensed under the MIT License — feel free to use and modify.
 ```
 
----
-
-## 📄 License
-
-[MIT License](LICENSE) — free to use, modify, and distribute.
-
+```
