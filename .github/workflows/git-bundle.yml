@@ -1,0 +1,308 @@
+name: 🗄️ Git Bundle & Release
+
+# Clones a repository, packs it as a git bundle, and publishes a GitHub Release.
+# Bundles are natively supported by git and restore with a simple `git clone`.
+
+on:
+  workflow_dispatch:
+    inputs:
+
+      repo_url:
+        description: "🔗 Repository URL — optionally append branch with -b (e.g. https://github.com/user/repo.git -b dev)"
+        required: true
+        type: string
+
+      clone_depth:
+        description: "🔢 Clone depth (0 = full history, 1 = latest commit only)"
+        required: false
+        type: choice
+        options:
+          - "0"
+          - "1"
+          - "10"
+          - "50"
+        default: "0"
+
+      split_size:
+        description: "✂️ Max chunk size (e.g. 1900M) — leave blank to disable"
+        required: false
+        type: string
+        default: "1900M"
+
+      prerelease:
+        description: "🚧 Publish as pre-release"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  WORK_DIR:  /tmp/git-snap
+  PARTS_DIR: /tmp/parts
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends git
+          mkdir -p "$WORK_DIR" "$PARTS_DIR"
+          echo "git $(git --version | awk '{print $3}')"
+
+      - name: Pre-flight
+        id: preflight
+        run: |
+          RAW_INPUT="${{ inputs.repo_url }}"
+
+          # Extract optional "-b <branch>" suffix the user can append to the URL field
+          REPO_URL=$(echo "$RAW_INPUT" | awk '{print $1}')
+          BRANCH=""
+          if [[ "$RAW_INPUT" =~ [[:space:]]-b[[:space:]]+([^[:space:]]+) ]]; then
+            BRANCH="${BASH_REMATCH[1]}"
+          fi
+
+          if [[ ! "$REPO_URL" =~ ^https?:// ]]; then
+            echo "::error::URL must start with http:// or https://"
+            exit 1
+          fi
+
+          REPO_NAME=$(basename "$REPO_URL" .git)
+          SAFE_NAME=$(echo "$REPO_NAME" | tr ' ' '_' | tr -cd '[:alnum:]._-')
+          [[ -z "$SAFE_NAME" ]] && SAFE_NAME="repo_${{ github.run_number }}"
+
+          if [[ -n "$BRANCH" ]]; then
+            SAFE_BRANCH=$(echo "$BRANCH" | tr '/' '-' | tr -cd '[:alnum:]._-')
+            ARCHIVE_BASE="${SAFE_NAME}-${SAFE_BRANCH}"
+          else
+            ARCHIVE_BASE="$SAFE_NAME"
+          fi
+
+          TIMESTAMP=$(date +'%Y%m%d-%H%M')
+          TAG="git-snap-${ARCHIVE_BASE}-${TIMESTAMP}"
+          BRANCH_LABEL="${BRANCH:-default branch}"
+          RELEASE_NAME="🗄️ ${SAFE_NAME} (${BRANCH_LABEL}) — git snapshot ${TIMESTAMP}"
+
+          DEPTH_LABEL="full history"
+          [[ "${{ inputs.clone_depth }}" != "0" ]] && \
+            DEPTH_LABEL="depth ${{ inputs.clone_depth }}"
+
+          {
+            echo "repo_url=$REPO_URL"
+            echo "branch=$BRANCH"
+            echo "branch_label=$BRANCH_LABEL"
+            echo "safe_name=$SAFE_NAME"
+            echo "archive_base=$ARCHIVE_BASE"
+            echo "tag=$TAG"
+            echo "release_name=$RELEASE_NAME"
+            echo "timestamp=$TIMESTAMP"
+            echo "depth_label=$DEPTH_LABEL"
+          } >> "$GITHUB_OUTPUT"
+
+          printf '%-22s %s\n' "📁 Repo:"        "$SAFE_NAME"
+          printf '%-22s %s\n' "🌿 Branch:"      "$BRANCH_LABEL"
+          printf '%-22s %s\n' "🔢 Depth:"       "$DEPTH_LABEL"
+          printf '%-22s %s\n' "🏷️  Tag:"        "$TAG"
+
+      - name: Clone repository
+        id: clone
+        run: |
+          echo "::group::git clone"
+          CLONE_DIR="$WORK_DIR/${{ steps.preflight.outputs.safe_name }}"
+          BRANCH="${{ steps.preflight.outputs.branch }}"
+          DEPTH="${{ inputs.clone_depth }}"
+
+          GIT_FLAGS=(--progress)
+          [[ "$DEPTH" != "0" ]] && GIT_FLAGS+=(--depth "$DEPTH")
+          [[ -n "$BRANCH" ]]    && GIT_FLAGS+=(-b "$BRANCH")
+
+          START=$(date +%s)
+          git clone "${GIT_FLAGS[@]}" "${{ steps.preflight.outputs.repo_url }}" "$CLONE_DIR"
+          ELAPSED=$(( $(date +%s) - START ))
+          ELAPSED_FMT=$(printf '%dm %ds' $(( ELAPSED / 60 )) $(( ELAPSED % 60 )))
+
+          {
+            echo "clone_dir=$CLONE_DIR"
+            echo "clone_size=$(du -sh "$CLONE_DIR" | cut -f1)"
+            echo "elapsed=$ELAPSED_FMT"
+          } >> "$GITHUB_OUTPUT"
+
+          printf '%-22s %s\n' "📦 Clone size:" "$(du -sh "$CLONE_DIR" | cut -f1)"
+          printf '%-22s %s\n' "⏱️  Time:"       "$ELAPSED_FMT"
+          echo "::endgroup::"
+
+      - name: Create git bundle
+        id: bundle
+        run: |
+          echo "::group::git bundle"
+          BUNDLE="$WORK_DIR/${{ steps.preflight.outputs.archive_base }}.bundle"
+
+          START=$(date +%s)
+          cd "${{ steps.clone.outputs.clone_dir }}"
+          git bundle create "$BUNDLE" --all
+          ELAPSED=$(( $(date +%s) - START ))
+          ELAPSED_FMT=$(printf '%dm %ds' $(( ELAPSED / 60 )) $(( ELAPSED % 60 )))
+
+          BUNDLE_BYTES=$(stat -c%s "$BUNDLE")
+          BUNDLE_SIZE=$(numfmt --to=iec "$BUNDLE_BYTES")
+
+          {
+            echo "bundle=$BUNDLE"
+            echo "bundle_name=$(basename "$BUNDLE")"
+            echo "bundle_bytes=$BUNDLE_BYTES"
+            echo "bundle_size=$BUNDLE_SIZE"
+            echo "elapsed=$ELAPSED_FMT"
+          } >> "$GITHUB_OUTPUT"
+
+          printf '%-22s %s\n' "📦 Bundle:" "$(basename "$BUNDLE") ($BUNDLE_SIZE)"
+          printf '%-22s %s\n' "⏱️  Time:"   "$ELAPSED_FMT"
+          echo "::notice::✅ Bundle created — $BUNDLE_SIZE"
+          echo "::endgroup::"
+
+      - name: Size check & split if needed
+        id: split
+        run: |
+          echo "::group::Split check"
+          BUNDLE="${{ steps.bundle.outputs.bundle }}"
+          BUNDLE_NAME="${{ steps.bundle.outputs.bundle_name }}"
+          BUNDLE_BYTES="${{ steps.bundle.outputs.bundle_bytes }}"
+          SPLIT_SIZE="${{ inputs.split_size }}"
+          DID_SPLIT=false
+          PART_COUNT=1
+
+          if [[ -z "$SPLIT_SIZE" ]]; then
+            cp "$BUNDLE" "$PARTS_DIR/"
+          else
+            SPLIT_BYTES=$(numfmt --from=iec "$SPLIT_SIZE")
+            if (( BUNDLE_BYTES > SPLIT_BYTES )); then
+              echo "⚠️  $(numfmt --to=iec $BUNDLE_BYTES) > $SPLIT_SIZE — splitting..."
+              split \
+                --bytes="$SPLIT_SIZE" \
+                --numeric-suffixes=1  \
+                --suffix-length=3     \
+                "$BUNDLE"             \
+                "$PARTS_DIR/${BUNDLE_NAME}.part"
+              DID_SPLIT=true
+              PART_COUNT=$(find "$PARTS_DIR" -name "*.part*" | wc -l)
+              echo "::notice::✂️ Split into $PART_COUNT parts"
+              ls -lh "$PARTS_DIR/"
+            else
+              echo "✅ $(numfmt --to=iec $BUNDLE_BYTES) — within limit"
+              cp "$BUNDLE" "$PARTS_DIR/"
+            fi
+          fi
+
+          {
+            echo "split=$DID_SPLIT"
+            echo "part_count=$PART_COUNT"
+          } >> "$GITHUB_OUTPUT"
+          echo "::endgroup::"
+
+      - name: Generate SHA256 checksums
+        run: |
+          cd "$PARTS_DIR"
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Generate release notes
+        run: |
+          BUNDLE_NAME="${{ steps.bundle.outputs.bundle_name }}"
+          DID_SPLIT="${{ steps.split.outputs.split }}"
+          PART_COUNT="${{ steps.split.outputs.part_count }}"
+          CHECKSUMS=$(cat "$PARTS_DIR/SHA256SUMS.txt")
+
+          cat > release_notes.md << NOTES
+          ## 🗄️ ${{ steps.preflight.outputs.release_name }}
+
+          > This release contains a **git bundle** — a portable, self-contained snapshot of the repository that can be cloned directly.
+
+          ### 🔗 Source
+          | Field | Value |
+          |-------|-------|
+          | Repository | \`${{ steps.preflight.outputs.repo_url }}\` |
+          | Branch | \`${{ steps.preflight.outputs.branch_label }}\` |
+          | Clone depth | ${{ steps.preflight.outputs.depth_label }} |
+          | Clone size | ${{ steps.clone.outputs.clone_size }} |
+
+          ### ⚙️ Processing
+          | Step | Result |
+          |------|--------|
+          | Bundle size | ${{ steps.bundle.outputs.bundle_size }} |
+          | Split | ${DID_SPLIT} (${PART_COUNT} part(s)) |
+
+          ### 🏗️ Build Info
+          | Field | Value |
+          |-------|-------|
+          | Clone time | ${{ steps.clone.outputs.elapsed }} |
+          | Bundle time | ${{ steps.bundle.outputs.elapsed }} |
+          | Date | $(date -u +'%Y-%m-%d %H:%M UTC') |
+          | Triggered by | @${{ github.actor }} |
+          | Workflow run | [${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+
+          ---
+
+          ### 🔐 SHA256 Checksums
+          \`\`\`
+          ${CHECKSUMS}
+          \`\`\`
+
+          ### ♻️ Restore Working Copy
+          \`\`\`bash
+          # Verify integrity
+          sha256sum -c SHA256SUMS.txt
+
+          # Clone directly from the bundle — works like any remote
+          git clone ${BUNDLE_NAME} my-repo
+          \`\`\`
+          NOTES
+
+          if [[ "$DID_SPLIT" == "true" ]]; then
+            cat >> release_notes.md << REASSEMBLE
+
+          ### 🧩 Reassemble Split Parts First
+          \`\`\`bash
+          cat ${BUNDLE_NAME}.part* > ${BUNDLE_NAME}
+          sha256sum -c SHA256SUMS.txt
+          git clone ${BUNDLE_NAME} my-repo
+          \`\`\`
+          REASSEMBLE
+          fi
+
+      - name: Write job summary
+        if: always()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ## 🗄️ Git Snapshot & Release
+
+          | Field | Value |
+          |-------|-------|
+          | 🔗 Repository | \`${{ steps.preflight.outputs.repo_url }}\` |
+          | 🌿 Branch | ${{ steps.preflight.outputs.branch_label }} |
+          | 🔢 Depth | ${{ steps.preflight.outputs.depth_label }} |
+          | 📦 Clone size | ${{ steps.clone.outputs.clone_size }} |
+          | 📦 Bundle size | ${{ steps.bundle.outputs.bundle_size }} |
+          | ✂️ Split | ${{ steps.split.outputs.split }} (${{ steps.split.outputs.part_count }} part(s)) |
+          | 🏷️ Tag | \`${{ steps.preflight.outputs.tag }}\` |
+          | ▶️ Run | [${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |
+          EOF
+
+      - name: Publish GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag:                     "${{ steps.preflight.outputs.tag }}"
+          name:                    "${{ steps.preflight.outputs.release_name }}"
+          bodyFile:                "release_notes.md"
+          artifacts:               "/tmp/parts/*"
+          artifactErrorsFailBuild: true
+          makeLatest:              true
+          prerelease:              ${{ inputs.prerelease }}
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf "$WORK_DIR" "$PARTS_DIR"
